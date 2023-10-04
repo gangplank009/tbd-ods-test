@@ -1,0 +1,692 @@
+kind: pipeline
+name: pull-request-on-development
+
+trigger:
+  event:
+    - pull-request
+  target:
+    - development
+
+volumes:
+  - name: m2-cache
+    host:
+      path: /tmp/m2-cache-new
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+anchors:
+  - &mvn-step
+    image: ghcr.io/kazanexpress/maven:3.8.5-openjdk-11
+    privileged: true
+    volumes:
+      - name: m2-cache
+        path: /root/.m2
+      - name: docker
+        path: /var/run/docker.sock
+    environment:
+      SERVER_USERNAME:
+        from_secret: server_username
+      SERVER_PASSWORD:
+        from_secret: server_password
+      SONAR_HOST:
+        from_secret: sonar_host
+      SONAR_TOKEN:
+        from_secret: sonar_token
+      SONAR_PROJECT_NAME: wms-delivery-point-service
+      GIT_PUSH_SSH_KEY:
+        from_secret: git_ssh_key
+
+steps:
+  - name: compile
+    <<: *mvn-step
+    commands:
+      - mvn compile -B -Dmaven.test.skip=true
+
+  - name: test
+    <<: *mvn-step
+    commands:
+      - mvn compiler:testCompile surefire:test
+    depends_on:
+      - compile
+    when:
+      status:
+        - success
+---
+
+kind: pipeline
+name: push-to-development
+
+trigger:
+  event:
+    - push
+  target:
+    - development
+
+volumes:
+  - name: m2-cache
+    host:
+      path: /tmp/m2-cache-new
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+anchors:
+  - &mvn-step
+    image: ghcr.io/kazanexpress/maven:3.8.5-openjdk-11
+    privileged: true
+    volumes:
+      - name: m2-cache
+        path: /root/.m2
+      - name: docker
+        path: /var/run/docker.sock
+    environment:
+      SERVER_USERNAME:
+        from_secret: server_username
+      SERVER_PASSWORD:
+        from_secret: server_password
+      SONAR_HOST:
+        from_secret: sonar_host
+      SONAR_TOKEN:
+        from_secret: sonar_token
+      SONAR_PROJECT_NAME: wms-delivery-point-service
+      GIT_PUSH_SSH_KEY:
+        from_secret: git_ssh_key
+
+steps:
+  - name: package and test
+    <<: *mvn-step
+    commands:
+      - mvn package -U -B
+
+  - name: deploy to nexus
+    <<: *mvn-step
+    commands:
+      - mvn deploy -B -Dmaven.test.skip=true -Dmaven.install.skip=true
+    depends_on:
+      - package and test
+    when:
+      status:
+        - success
+
+  - name: docker image
+    image: plugins/docker
+    settings:
+      username: json_key
+      registry: cr.yandex
+      dockerfile: Dockerfile
+      repo: 'cr.yandex/kazanexpress/${DRONE_REPO_NAME}'
+      tags: '${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}'
+      use_cache: true
+      purge: false
+      password:
+        from_secret: yandex_cr_json_key
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    depends_on:
+      - deploy to nexus
+    when:
+      status:
+        - success
+
+  - name: helm deploy dev KE
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/ke.values.yaml
+        --values ./deploy/helm/ke.dev.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --set "server.config.spring.kafka.user=$${KAFKA_USER}"
+        --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
+        --set "server.metaship.client-id=$${METASHIP_CLIENT_ID}"
+        --set "server.metaship.client-secret=$${METASHIP_CLIENT_SECRET}"
+        --timeout 15m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms-backend
+      IMAGE: "cr.yandex/kazanexpress/${DRONE_REPO_NAME}:${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}-${DRONE_COMMIT_SHA:0:7}"
+      POSTGRES_USER:
+        from_secret: dev_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: dev_postgres_password
+      KAFKA_USER:
+        from_secret: dev_kafka_user
+      KAFKA_PASSWORD:
+        from_secret: dev_kafka_password
+      HELM_KUBEAPISERVER:
+        from_secret: yc_dev_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: yc_dev_kubernetes_token
+      HELM_CERT:
+        from_secret: yc_dev_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+      METASHIP_CLIENT_ID:
+        from_secret: dev_metaship_client_id
+      METASHIP_CLIENT_SECRET:
+        from_secret: dev_metaship_client_secret
+    when:
+      branch:
+        - development
+      event:
+        - push
+---
+
+
+kind: pipeline
+name: wms-delivery-point-service
+
+trigger:
+  event:
+    exclude:
+      - promote
+
+volumes:
+  - name: m2-cache
+    host:
+      path: /tmp/m2-cache-new
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+anchors:
+  - &mvn-step
+    image: ghcr.io/kazanexpress/maven:3.8.5-openjdk-11
+    privileged: true
+    volumes:
+      - name: m2-cache
+        path: /root/.m2
+      - name: docker
+        path: /var/run/docker.sock
+    environment:
+      SERVER_USERNAME:
+        from_secret: server_username
+      SERVER_PASSWORD:
+        from_secret: server_password
+      SONAR_HOST:
+        from_secret: sonar_host
+      SONAR_TOKEN:
+        from_secret: sonar_token
+      SONAR_PROJECT_NAME: wms-delivery-point-service
+      GIT_PUSH_SSH_KEY:
+        from_secret: git_ssh_key
+
+steps:
+  # - name: enforce-snapshot-version
+  #   <<: *mvn-step
+  #   commands:
+  #     - mvn enforcer:enforce@snapshot-version
+  #   when:
+  #     branch:
+  #       - development
+
+  # depends_on:
+  # - frontend
+  # - backend
+
+  # when:
+  #   status:
+  #   - success
+  #   - failure
+
+  - name: prepare-deploy
+    <<: *mvn-step
+    commands:
+      - mkdir ~/.ssh/
+      - echo "$GIT_PUSH_SSH_KEY" > ~/.ssh/id_rsa
+      - eval `ssh-agent -s`
+      - chmod 400 ~/.ssh/id_rsa
+      - ssh-add ~/.ssh/id_rsa
+      - ssh-add -l
+      - git config --global user.email "${DRONE_COMMIT_AUTHOR_EMAIL}"
+      - git config --global user.name "${DRONE_COMMIT_AUTHOR}"
+      - ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+      - mvn -B -U versions:use-releases -DprocessParent=true
+      - mvn -B scm:checkin -Dmessage="[SKIP CI] Update dependency versions" -DpushChanges=false
+      - mvn -B -DskipTests -Darguments=-DskipTests release:prepare
+      - git fetch origin development
+      - git checkout development
+      - git merge master --no-ff --no-edit -m "Merge branch 'master' into development [skip ci]"
+      - git push
+    when:
+      branch:
+        - master
+      event:
+        - push
+
+  - name: build-and-test
+    <<: *mvn-step
+    commands:
+      - mvn package -U -B
+    when:
+      branch:
+        exclude:
+          - master
+
+  - name: tests
+    <<: *mvn-step
+    commands:
+      - mvn test -U -B
+    when:
+      branch:
+        - master
+      event:
+        - pull_request
+
+  - name: deploy to nexus
+    <<: *mvn-step
+    commands:
+      - mvn deploy -B -Dmaven.test.skip=true -Dmaven.install.skip=true
+    when:
+      ref:
+        - refs/heads/development
+        - refs/tags/*
+      event:
+        - push
+        - tag
+
+  - name: build and push image for KE
+    image: plugins/docker
+    settings:
+      username: json_key
+      registry: cr.yandex
+      dockerfile: Dockerfile
+      repo: 'cr.yandex/kazanexpress/${DRONE_REPO_NAME}'
+      tags: '${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}-${DRONE_COMMIT_SHA:0:7}'
+      use_cache: true
+      purge: false
+      password:
+        from_secret: yandex_cr_json_key
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    when:
+      ref:
+        - refs/heads/development
+        - refs/tags/*
+      event:
+        - push
+        - tag
+
+
+  - name: helm deploy dev KE
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/ke.values.yaml
+        --values ./deploy/helm/ke.dev.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --set "server.config.spring.kafka.user=$${KAFKA_USER}"
+        --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
+        --set "server.metaship.client-id=$${METASHIP_CLIENT_ID}"
+        --set "server.metaship.client-secret=$${METASHIP_CLIENT_SECRET}"
+        --timeout 15m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms-backend
+      IMAGE: "cr.yandex/kazanexpress/${DRONE_REPO_NAME}:${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}-${DRONE_COMMIT_SHA:0:7}"
+      POSTGRES_USER:
+        from_secret: dev_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: dev_postgres_password
+      KAFKA_USER:
+        from_secret: dev_kafka_user
+      KAFKA_PASSWORD:
+        from_secret: dev_kafka_password
+      HELM_KUBEAPISERVER:
+        from_secret: yc_dev_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: yc_dev_kubernetes_token
+      HELM_CERT:
+        from_secret: yc_dev_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+      METASHIP_CLIENT_ID:
+        from_secret: dev_metaship_client_id
+      METASHIP_CLIENT_SECRET:
+        from_secret: dev_metaship_client_secret
+    when:
+      branch:
+        - development
+      event:
+        - push
+
+
+  - name: helm deploy prod KE
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --create-namespace
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/ke.values.yaml
+        --values ./deploy/helm/ke.prod.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.config.rupost.authToken=$${RUSSIAN_POST_AUTH_TOKEN}"
+        --set "server.config.rupost.authKey=$${RUSSIAN_POST_AUTH_KEY}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --timeout 15m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms-backend
+      IMAGE: "cr.yandex/kazanexpress/${DRONE_REPO_NAME}:${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}-${DRONE_COMMIT_SHA:0:7}"
+      RUSSIAN_POST_AUTH_TOKEN:
+        from_secret: RUSSIAN_POST_AUTHORIZATION_TOKEN
+      RUSSIAN_POST_AUTH_KEY:
+        from_secret: RUSSIAN_POST_AUTHORIZATION_KEY
+      POSTGRES_USER:
+        from_secret: prod_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: prod_postgres_password
+      HELM_KUBEAPISERVER:
+        from_secret: yc_prod_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: yc_prod_kubernetes_token
+      HELM_CERT:
+        from_secret: yc_prod_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+    when:
+      ref:
+        - refs/tags/*
+      event:
+        - push
+        - tag
+
+  - name: sonarqube PR
+    <<: *mvn-step
+    commands:
+      - >
+        mvn sonar:sonar
+        -Dsonar.host.url=$SONAR_HOST
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.pullrequest.key=$DRONE_PULL_REQUEST
+        -Dsonar.pullrequest.branch=$DRONE_SOURCE_BRANCH
+        -Dsonar.pullrequest.base=$DRONE_TARGET_BRANCH
+        -Dsonar.projectName=$SONAR_PROJECT_NAME
+    when:
+      event:
+        - pull_request
+      branch:
+        - development
+
+  - name: sonarqube branch
+    <<: *mvn-step
+    commands:
+      - >
+        mvn sonar:sonar
+        -Dsonar.host.url=$SONAR_HOST
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.branch.name=$DRONE_COMMIT_BRANCH
+        -Dsonar.projectName=$SONAR_PROJECT_NAME
+    when:
+      event:
+        - push
+      branch:
+        - development
+
+  - name: telegram_success
+    image: appleboy/drone-telegram
+    environment:
+      TELEGRAM_TOKEN:
+        from_secret: telegram_token
+      TELEGRAM_TO:
+        from_secret: telegram_to
+    when:
+      status:
+        - success
+      ref:
+        - refs/heads/development
+        - refs/tags/*
+    settings:
+      format: markdown
+      message: >
+        ⚙️ Status: build successful ✅
+        🔸 Repository: ${DRONE_REPO_NAME}
+        ☘️ Branch: ** ${DRONE_BRANCH} **
+        📌 Commit: [${DRONE_COMMIT_MESSAGE}](${DRONE_COMMIT_LINK})
+        🚀 Build URL: [build ${DRONE_BUILD_NUMBER}](${DRONE_BUILD_LINK})
+        👨‍💻  Author:  [@${DRONE_COMMIT_AUTHOR}](https://github.com/${DRONE_COMMIT_AUTHOR})
+
+  - name: telegram_failure
+    image: appleboy/drone-telegram
+    failure: ignored
+    environment:
+      TELEGRAM_TOKEN:
+        from_secret: telegram_token
+      TELEGRAM_TO:
+        from_secret: telegram_to
+    when:
+      status:
+        - failure
+      ref:
+        - refs/heads/development
+        - refs/tags/*
+    settings:
+      format: markdown
+      message: >
+        ⚙️ Status: build failed 🚨
+        🔸 Repository: ${DRONE_REPO_NAME}
+        ☘️ Branch: ** ${DRONE_BRANCH} **
+        📌 Commit: [${DRONE_COMMIT_MESSAGE}](${DRONE_COMMIT_LINK})
+        🚀 Build URL: [build ${DRONE_BUILD_NUMBER}](${DRONE_BUILD_LINK})
+        👨‍💻  Author:  [@${DRONE_COMMIT_AUTHOR}](https://github.com/${DRONE_COMMIT_AUTHOR})
+---
+
+kind: pipeline
+name: wms-delivery-point-service-um
+
+trigger:
+  event:
+    - promote
+  target:
+    - um-prod
+    - um-dev
+
+volumes:
+  - name: m2-cache
+    host:
+      path: /tmp/m2-cache-new
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+anchors:
+  - &mvn-step
+    image: ghcr.io/kazanexpress/maven:3.8.5-openjdk-11
+    privileged: true
+    volumes:
+      - name: m2-cache
+        path: /root/.m2
+      - name: docker
+        path: /var/run/docker.sock
+    environment:
+      SERVER_USERNAME:
+        from_secret: server_username
+      SERVER_PASSWORD:
+        from_secret: server_password
+      SONAR_HOST:
+        from_secret: sonar_host
+      SONAR_TOKEN:
+        from_secret: sonar_token
+      SONAR_PROJECT_NAME: wms-delivery-point-service
+      GIT_PUSH_SSH_KEY:
+        from_secret: git_ssh_key
+
+steps:
+  - name: build-and-test
+    <<: *mvn-step
+    commands:
+      - mvn package -U -B
+
+  - name: build and push image for UM
+    image: plugins/docker
+    settings:
+      username: json_key
+      registry: cr.yandex
+      password:
+        from_secret: um_yandex_cr_json_key
+      repo: 'cr.yandex/umarket/${DRONE_REPO_NAME}'
+      use_cache: true
+      tags: ${DRONE_BUILD_NUMBER}
+      purge: false
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+
+  - name: helm deploy dev UM
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/uz.values.yaml
+        --values ./deploy/helm/uz.dev.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --set "server.config.spring.kafka.user=$${KAFKA_USER}"
+        --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
+        --timeout 15m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms
+      IMAGE: "cr.yandex/umarket/${DRONE_REPO_NAME}:${DRONE_BUILD_NUMBER}"
+      POSTGRES_USER:
+        from_secret: um_dev_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: um_dev_postgres_password
+      KAFKA_USER:
+        from_secret: um_dev_common_kafka_wms_admin_user
+      KAFKA_PASSWORD:
+        from_secret: um_dev_common_kafka_wms_admin_password
+      HELM_KUBEAPISERVER:
+        from_secret: um_dev_cluster_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: um_dev_cluster_kubernetes_token
+      HELM_CERT:
+        from_secret: um_dev_cluster_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+    when:
+      target:
+        - um-dev
+
+  - name: helm prod deploy UM
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --create-namespace
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/uz.values.yaml
+        --values ./deploy/helm/uz.prod.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --set "server.config.spring.kafka.user=$${KAFKA_USER}"
+        --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
+        --timeout 15m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms
+      IMAGE: "cr.yandex/umarket/${DRONE_REPO_NAME}:${DRONE_BUILD_PARENT}"
+      POSTGRES_USER:
+        from_secret: um_prod_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: um_prod_postgres_password
+      KAFKA_USER:
+        from_secret: um_prod_common_kafka_wms_admin_user
+      KAFKA_PASSWORD:
+        from_secret: um_prod_common_kafka_wms_admin_password
+      HELM_KUBEAPISERVER:
+        from_secret: um_prod_cluster_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: um_prod_cluster_kubernetes_token
+      HELM_CERT:
+        from_secret: um_prod_cluster_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+    when:
+      target:
+        - um-prod
