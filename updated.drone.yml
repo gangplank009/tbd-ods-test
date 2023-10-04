@@ -3,8 +3,11 @@ name: pull-request-on-development
 
 trigger:
   event:
-    - pull-request
-  target:
+    - pull_request
+  action:
+    - opened
+    - synchronized
+  branch:
     - development
 
 volumes:
@@ -33,7 +36,7 @@ anchors:
         from_secret: sonar_host
       SONAR_TOKEN:
         from_secret: sonar_token
-      SONAR_PROJECT_NAME: wms-delivery-point-service
+      SONAR_PROJECT_NAME: wms-courier
       GIT_PUSH_SSH_KEY:
         from_secret: git_ssh_key
 
@@ -46,7 +49,24 @@ steps:
   - name: test
     <<: *mvn-step
     commands:
-      - mvn compiler:testCompile surefire:test
+      - mvn resources:testResources compiler:testCompile surefire:test
+    depends_on:
+      - compile
+    when:
+      status:
+        - success
+
+  - name: sonarqube PR
+    <<: *mvn-step
+    commands:
+      - >
+        mvn sonar:sonar
+        -Dsonar.host.url=$SONAR_HOST
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.pullrequest.key=$DRONE_PULL_REQUEST
+        -Dsonar.pullrequest.branch=$DRONE_SOURCE_BRANCH
+        -Dsonar.pullrequest.base=$DRONE_TARGET_BRANCH
+        -Dsonar.projectName=$SONAR_PROJECT_NAME
     depends_on:
       - compile
     when:
@@ -60,7 +80,7 @@ name: push-to-development
 trigger:
   event:
     - push
-  target:
+  branch:
     - development
 
 volumes:
@@ -89,7 +109,7 @@ anchors:
         from_secret: sonar_host
       SONAR_TOKEN:
         from_secret: sonar_token
-      SONAR_PROJECT_NAME: wms-delivery-point-service
+      SONAR_PROJECT_NAME: wms-courier
       GIT_PUSH_SSH_KEY:
         from_secret: git_ssh_key
 
@@ -98,6 +118,21 @@ steps:
     <<: *mvn-step
     commands:
       - mvn package -U -B
+
+  - name: sonarqube development
+    <<: *mvn-step
+    commands:
+      - >
+        mvn sonar:sonar
+        -Dsonar.host.url=$SONAR_HOST
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.branch.name=$DRONE_COMMIT_BRANCH
+        -Dsonar.projectName=$SONAR_PROJECT_NAME
+    depends_on:
+      - package and test
+    when:
+      status:
+        - success
 
   - name: deploy to nexus
     <<: *mvn-step
@@ -109,14 +144,14 @@ steps:
       status:
         - success
 
-  - name: docker image
+  - name: docker image KE
     image: plugins/docker
     settings:
       username: json_key
       registry: cr.yandex
       dockerfile: Dockerfile
       repo: 'cr.yandex/kazanexpress/${DRONE_REPO_NAME}'
-      tags: '${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}'
+      tags: '${DRONE_BUILD_NUMBER}'
       use_cache: true
       purge: false
       password:
@@ -126,6 +161,27 @@ steps:
         path: /var/run/docker.sock
     depends_on:
       - deploy to nexus
+    when:
+      status:
+        - success
+
+  - name: docker image UZ
+    image: plugins/docker
+    settings:
+      username: json_key
+      registry: cr.yandex
+      dockerfile: Dockerfile
+      repo: 'cr.yandex/umarket/${DRONE_REPO_NAME}'
+      tags: '${DRONE_BUILD_NUMBER}'
+      use_cache: true
+      purge: false
+      password:
+        from_secret: um_yandex_cr_json_key
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    depends_on:
+      - docker image KE
     when:
       status:
         - success
@@ -154,13 +210,11 @@ steps:
         --set "server.postgres.password=$${POSTGRES_PASSWORD}"
         --set "server.config.spring.kafka.user=$${KAFKA_USER}"
         --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
-        --set "server.metaship.client-id=$${METASHIP_CLIENT_ID}"
-        --set "server.metaship.client-secret=$${METASHIP_CLIENT_SECRET}"
-        --timeout 15m0s
+        --timeout 3m0s
     environment:
       RELEASE_NAME: ${DRONE_REPO_NAME}
       KUBE_NAMESPACE: svc-wms-backend
-      IMAGE: "cr.yandex/kazanexpress/${DRONE_REPO_NAME}:${DRONE_REPO_BRANCH}-${DRONE_BUILD_NUMBER}-${DRONE_COMMIT_SHA:0:7}"
+      IMAGE: "cr.yandex/kazanexpress/${DRONE_REPO_NAME}:${DRONE_BUILD_NUMBER}"
       POSTGRES_USER:
         from_secret: dev_postgres_user
       POSTGRES_PASSWORD:
@@ -180,16 +234,105 @@ steps:
         from_secret: nexus_helm_puller_username
       HELM_PULLER_PASSWORD:
         from_secret: nexus_helm_puller_password
-      METASHIP_CLIENT_ID:
-        from_secret: dev_metaship_client_id
-      METASHIP_CLIENT_SECRET:
-        from_secret: dev_metaship_client_secret
+    depends_on:
+      - docker image KE
     when:
-      branch:
-        - development
-      event:
-        - push
+      status:
+        - success
+
+  - name: helm deploy dev UM
+    image: alpine/helm
+    commands:
+      - echo $${HELM_CERT} | base64 -d > $${HELM_KUBECAFILE}
+      - helm upgrade $${RELEASE_NAME} wms-common-chart
+        --namespace $${KUBE_NAMESPACE}
+        --repo "https://nexus.infra.cluster.kznexpess.com/repository/helm-museum/"
+        --username "$${HELM_PULLER_USERNAME}"
+        --password "$${HELM_PULLER_PASSWORD}"
+        --version 0.1.2
+        --install
+        --atomic
+        --cleanup-on-fail
+        --values ./deploy/helm/values.yaml
+        --values ./deploy/helm/uz.values.yaml
+        --values ./deploy/helm/uz.dev.values.yaml
+        --set "repo.name=${DRONE_REPO_NAME}"
+        --set "repo.branch=${DRONE_COMMIT_BRANCH}"
+        --set "repo.lastCommitHash=${DRONE_COMMIT_SHA:0:7}"
+        --set "server.image=$${IMAGE}"
+        --set "server.postgres.user=$${POSTGRES_USER}"
+        --set "server.postgres.password=$${POSTGRES_PASSWORD}"
+        --set "server.config.spring.kafka.user=$${KAFKA_USER}"
+        --set "server.config.spring.kafka.password=$${KAFKA_PASSWORD}"
+        --timeout 3m0s
+    environment:
+      RELEASE_NAME: ${DRONE_REPO_NAME}
+      KUBE_NAMESPACE: svc-wms
+      IMAGE: "cr.yandex/umarket/${DRONE_REPO_NAME}:${DRONE_BUILD_NUMBER}"
+      POSTGRES_USER:
+        from_secret: um_dev_postgres_user
+      POSTGRES_PASSWORD:
+        from_secret: um_dev_postgres_password
+      KAFKA_USER:
+        from_secret: um_dev_common_kafka_wms_admin_user
+      KAFKA_PASSWORD:
+        from_secret: um_dev_common_kafka_wms_admin_password
+      HELM_KUBEAPISERVER:
+        from_secret: um_dev_cluster_kubernetes_server
+      HELM_KUBETOKEN:
+        from_secret: um_dev_cluster_kubernetes_token
+      HELM_CERT:
+        from_secret: um_dev_cluster_kubernetes_cert
+      HELM_KUBECAFILE: /tmp/ca.crt
+      HELM_PULLER_USERNAME:
+        from_secret: nexus_helm_puller_username
+      HELM_PULLER_PASSWORD:
+        from_secret: nexus_helm_puller_password
+    depends_on:
+      - docker image UZ
+    when:
+      status:
+        - success
 ---
+
+kind: pipeline
+name: push-to-development
+
+trigger:
+  event:
+    - push
+  branch:
+    - development
+
+volumes:
+  - name: m2-cache
+    host:
+      path: /tmp/m2-cache-new
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+anchors:
+  - &mvn-step
+    image: ghcr.io/kazanexpress/maven:3.8.5-openjdk-11
+    privileged: true
+    volumes:
+      - name: m2-cache
+        path: /root/.m2
+      - name: docker
+        path: /var/run/docker.sock
+    environment:
+      SERVER_USERNAME:
+        from_secret: server_username
+      SERVER_PASSWORD:
+        from_secret: server_password
+      SONAR_HOST:
+        from_secret: sonar_host
+      SONAR_TOKEN:
+        from_secret: sonar_token
+      SONAR_PROJECT_NAME: wms-courier
+      GIT_PUSH_SSH_KEY:
+        from_secret: git_ssh_key
 
 
 kind: pipeline
