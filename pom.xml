@@ -20,9 +20,9 @@
     </properties>
 
     <scm>
-        <connection>scm:git:git@github.com:KazanExpress/tbd-ods-test.git</connection>
-        <developerConnection>scm:git:git@github.com:KazanExpress/tbd-ods-test.git</developerConnection>
-        <url>https://github.com/KazanExpress/tbd-ods-test.git</url>
+        <connection>scm:git:git@github.com:gangplank009/tbd-ods-test.git</connection>
+        <developerConnection>scm:git:git@github.com:gangplank009/tbd-ods-test.git</developerConnection>
+        <url>https://github.com/gangplank009/tbd-ods-test.git</url>
         <tag>v0.0.2</tag>
     </scm>
 
